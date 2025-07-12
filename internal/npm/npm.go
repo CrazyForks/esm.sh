@@ -1,9 +1,12 @@
 package npm
 
 import (
-	"errors"
+	"errors" 
 	"net/url"
+	"regexp"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/ije/gox/utils"
 	"github.com/ije/gox/valid"
@@ -191,6 +194,61 @@ func IsExactVersion(version string) bool {
 	return true
 }
 
+// IsDateVersion returns true if the given version is a date in yyyy-mm-dd format.
+func IsDateVersion(version string) bool {
+	dateRegex := regexp.MustCompile(`^(\d{4})-(\d{1,2})-(\d{1,2})$`)
+	matches := dateRegex.FindStringSubmatch(version)
+	if matches == nil {
+		return false
+	}
+
+	year := matches[1]
+	month := matches[2]
+	day := matches[3]
+
+	if len(month) == 1 {
+		month = "0" + month
+	}
+	if len(day) == 1 {
+		day = "0" + day
+	}
+
+	// Parse and validate the date
+	dateStr := year + "-" + month + "-" + day + "T00:00:00Z"
+	_, err := time.Parse(time.RFC3339, dateStr)
+	return err == nil
+}
+
+// ConvertDateVersionToTime converts a date version (yyyy-mm-dd) to a time.Time.
+func ConvertDateVersionToTime(version string) (time.Time, error) {
+	if !IsDateVersion(version) {
+		return time.Time{}, errors.New("not a valid date version")
+	}
+
+	dateRegex := regexp.MustCompile(`^(\d{4})-(\d{1,2})-(\d{1,2})$`)
+	matches := dateRegex.FindStringSubmatch(version)
+	
+	year := matches[1]
+	month := matches[2]
+	day := matches[3]
+
+	if len(month) == 1 {
+		month = "0" + month
+	}
+	if len(day) == 1 {
+		day = "0" + day
+	}
+
+	// Parse and validate the date
+	dateStr := year + "-" + month + "-" + day + "T00:00:00Z"
+	t, err := time.Parse(time.RFC3339, dateStr)
+	if err != nil {
+		return time.Time{}, errors.New("invalid date format")
+	}
+
+	return t, nil
+}
+
 func isNumericString(s string) bool {
 	for _, c := range s {
 		if c < '0' || c > '9' {
@@ -223,3 +281,92 @@ func ToTypesPackageName(pkgName string) string {
 	}
 	return "@types/" + pkgName
 }
+
+
+// IsStableVersion returns true if the version is a stable release (not experimental, beta, alpha, etc.)
+func IsStableVersion(version string) bool {
+	v := strings.ToLower(version)
+	// Check for common prerelease identifiers
+	prereleaseKeywords := []string{
+		"experimental", "beta", "alpha", "rc", "pre", "preview", "canary", "dev", "nightly",
+		"snapshot", "test", "unstable", "next", "latest", "edge", "insiders",
+	}
+	
+	for _, keyword := range prereleaseKeywords {
+		if strings.Contains(v, keyword) {
+			return false
+		}
+	}
+	
+	// Additional check for semver prerelease pattern (e.g., 1.0.0-alpha.1)
+	if strings.Contains(version, "-") {
+		parts := strings.Split(version, "-")
+		if len(parts) > 1 {
+			prereleaseId := strings.ToLower(parts[1])
+			// Check if the prerelease identifier starts with a known prerelease keyword
+			for _, keyword := range prereleaseKeywords {
+				if strings.HasPrefix(prereleaseId, keyword) {
+					return false
+				}
+			}
+			// Also check if the entire prerelease identifier is a known keyword
+			for _, keyword := range prereleaseKeywords {
+				if prereleaseId == keyword {
+					return false
+				}
+			}
+		}
+	}
+	
+	return true
+}
+
+// ResolveVersionByTime finds the latest stable version published before or at the given time.
+func ResolveVersionByTime(metadata *PackageMetadata, targetTime time.Time) (string, error) {
+	type versionTime struct {
+		version string
+		time    time.Time
+	}
+
+	var validVersions []versionTime
+	for version, timeStr := range metadata.Time {
+		// Skip special entries like "created", "modified"
+		if version == "created" || version == "modified" {
+			continue
+		}
+		// Only include versions that exist in the versions map
+		if _, exists := metadata.Versions[version]; !exists {
+			continue
+		}
+
+		// Skip unstable versions (experimental, beta, alpha, etc.)
+		if !IsStableVersion(version) {
+			continue
+		}
+
+		publishTime, err := time.Parse(time.RFC3339, timeStr)
+		if err != nil {
+			continue // Skip invalid timestamps
+		}
+
+		// Only include versions published before or at the target time
+		if publishTime.Before(targetTime) || publishTime.Equal(targetTime) {
+			validVersions = append(validVersions, versionTime{
+				version: version,
+				time:    publishTime,
+			})
+		}
+	}
+
+	if len(validVersions) == 0 {
+		return "", errors.New("no stable versions found for the specified date")
+	}
+
+	// Sort by publish time, latest first
+	sort.Slice(validVersions, func(i, j int) bool {
+		return validVersions[i].time.After(validVersions[j].time)
+	})
+
+	return validVersions[0].version, nil
+}
+

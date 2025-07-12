@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,7 +25,6 @@ import (
 	"github.com/esm-dev/esm.sh/internal/mime"
 	"github.com/esm-dev/esm.sh/internal/npm"
 	"github.com/esm-dev/esm.sh/internal/storage"
-	"github.com/goccy/go-json"
 	esbuild "github.com/ije/esbuild-internal/api"
 	"github.com/ije/esbuild-internal/xxhash"
 	"github.com/ije/gox/log"
@@ -842,7 +842,7 @@ func esmRouter(db Database, buildStorage storage.Storage, logger *log.Logger) re
 			pathname = "/pr/" + pathname[13:]
 		}
 
-		esm, extraQuery, isExactVersion, hasTargetSegment, err := praseEsmPath(npmrc, pathname)
+		esm, extraQuery, isExactVersion, hasTargetSegment, err := parseEsmPath(npmrc, pathname)
 		if err != nil {
 			status := 500
 			message := err.Error()
@@ -1094,6 +1094,7 @@ func esmRouter(db Database, buildStorage storage.Storage, logger *log.Logger) re
 					}
 					entry := b.resolveEntry(esm)
 					if entry.main == "" {
+						ctx.SetHeader("Cache-Control", ccImmutable)
 						return rex.Status(404, "File Not Found")
 					}
 					query := ""
@@ -1135,11 +1136,13 @@ func esmRouter(db Database, buildStorage storage.Storage, logger *log.Logger) re
 					}
 					if err != nil {
 						if os.IsNotExist(err) {
+							ctx.SetHeader("Cache-Control", ccImmutable)
 							return rex.Status(404, "File Not Found")
 						}
 						return rex.Status(500, err.Error())
 					}
 					if stat.(os.FileInfo).IsDir() {
+						ctx.SetHeader("Cache-Control", ccImmutable)
 						return rex.Status(404, "File Not Found")
 					}
 					// limit the file size up to 50MB
@@ -1185,6 +1188,7 @@ func esmRouter(db Database, buildStorage storage.Storage, logger *log.Logger) re
 				ctx.SetHeader("Last-Modified", stat.ModTime().UTC().Format(http.TimeFormat))
 				ctx.SetHeader("Cache-Control", ccImmutable)
 				if strings.HasSuffix(esm.SubPath, ".json") && query.Has("module") {
+					defer content.Close()
 					jsonData, err := io.ReadAll(content)
 					if err != nil {
 						return rex.Status(500, err.Error())
@@ -1362,7 +1366,7 @@ func esmRouter(db Database, buildStorage storage.Storage, logger *log.Logger) re
 			for _, v := range strings.Split(query.Get("deps"), ",") {
 				v = strings.TrimSpace(v)
 				if v != "" {
-					m, _, _, _, err := praseEsmPath(npmrc, v)
+					m, _, _, _, err := parseEsmPath(npmrc, v)
 					if err != nil {
 						return rex.Status(400, fmt.Sprintf("Invalid deps query: %v not found", v))
 					}
@@ -1463,6 +1467,7 @@ func esmRouter(db Database, buildStorage storage.Storage, logger *log.Logger) re
 				case output := <-ch:
 					if output.err != nil {
 						if output.err.Error() == "types not found" {
+							ctx.SetHeader("Cache-Control", fmt.Sprintf("public, max-age=%d", config.NpmQueryCacheTTL))
 							return rex.Status(404, "Types Not Found")
 						}
 						return rex.Status(500, "Failed to build types: "+output.err.Error())
@@ -1541,9 +1546,10 @@ func esmRouter(db Database, buildStorage storage.Storage, logger *log.Logger) re
 							return redirect(ctx, url, isExactVersion)
 						}
 					} else {
-						if submodule == basename {
+						switch submodule {
+						case basename:
 							submodule = ""
-						} else if submodule == "__"+basename {
+						case "__" + basename:
 							// the sub-module name is same as the package name
 							submodule = basename
 						}
@@ -1577,6 +1583,7 @@ func esmRouter(db Database, buildStorage storage.Storage, logger *log.Logger) re
 				if output.err != nil {
 					msg := output.err.Error()
 					if msg == "could not resolve build entry" || strings.HasSuffix(msg, " not found") || strings.Contains(msg, "is not exported from package") || strings.Contains(msg, "no such file or directory") {
+						ctx.SetHeader("Cache-Control", fmt.Sprintf("public, max-age=%d", config.NpmQueryCacheTTL))
 						return rex.Status(404, msg)
 					}
 					return rex.Status(500, msg)
